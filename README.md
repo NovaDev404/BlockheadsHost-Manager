@@ -43,7 +43,7 @@ start on the next local date creates a new file. Output is written directly
 while the game process runs. `BLOCKHEADS_SERVER_CWD` sets the executable's
 working directory; it defaults to the manager's working directory.
 
-The Blockheads 2 option is reserved but currently returns HTTP 501 until its
+Blockheads 2 option is reserved but currently returns HTTP 501 until its
 server executable is added.
 
 ## Configure BlockheadsHost
