@@ -9,9 +9,11 @@ use axum::{
 };
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
 use std::{
     collections::{HashMap, HashSet},
     env,
+    ffi::CString,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
@@ -44,10 +46,18 @@ struct ServerStatusView {
     uptime_seconds: u64,
 }
 
+#[derive(Serialize, Clone)]
+struct ServerActivity {
+    kind: String,
+    message: String,
+    timestamp: String,
+}
+
 #[derive(Default)]
 struct ManagerState {
     processes: HashMap<String, ProcessRecord>,
     children: HashMap<String, Child>,
+    console_inputs: HashMap<String, fs::File>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -70,6 +80,8 @@ struct ProcessRecord {
     run_id: Option<String>,
     #[serde(default)]
     run_started_at: Option<u64>,
+    #[serde(default)]
+    console_fifo: Option<PathBuf>,
     #[serde(default)]
     log_path: Option<PathBuf>,
     #[serde(default)]
@@ -132,6 +144,11 @@ struct StartServer {
     max_players: u16,
     #[serde(default)]
     no_exit: bool,
+}
+
+#[derive(Deserialize)]
+struct ServerCommand {
+    command: String,
 }
 
 fn blockheads_server_args(input: &StartServer) -> Vec<String> {
@@ -225,6 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/servers/{id}/disconnect", post(disconnect_process))
         .route("/v1/servers/{id}/reconnect", post(reconnect_process))
         .route("/v1/servers/{id}/status", get(server_status))
+        .route("/v1/servers/{id}/activity", get(server_activity))
+        .route("/v1/servers/{id}/command", post(server_command))
         .route("/v1/servers/{id}/logs", get(server_logs))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate));
 
@@ -312,6 +331,7 @@ async fn create_process(
         game: None,
         run_id: None,
         run_started_at: None,
+        console_fifo: None,
         log_path: None,
         run_offset: 0,
         detached: false,
@@ -450,9 +470,23 @@ async fn start_server(
         .map_err(|error| internal_error(error.to_string()))?;
     let (log_path, mut log_file) = open_daily_log(&logs_dir).await.map_err(internal_error)?;
     let run_id = Uuid::new_v4().to_string();
-    let started_at = Local::now().format("%Y-%m-%d %H:%M:%S %:z");
+    let started_at = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let is_restart = manager
+        .processes
+        .get(&id)
+        .is_some_and(|record| record.run_id.is_some());
     log_file
-        .write_all(format!("\n=== Starting run {run_id} at {started_at} ===\n").as_bytes())
+        .write_all(
+            format!(
+                "\n=== Starting run {run_id} at {started_at} ===\n=== Activity {} {started_at} ===\n",
+                if is_restart {
+                    "server_restarted"
+                } else {
+                    "server_started"
+                }
+            )
+            .as_bytes(),
+        )
         .await
         .map_err(|error| internal_error(error.to_string()))?;
     log_file
@@ -468,11 +502,25 @@ async fn start_server(
         .try_clone()
         .await
         .map_err(|error| internal_error(error.to_string()))?;
+    let console_dir = state.data_dir.join("console");
+    fs::create_dir_all(&console_dir)
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+    let console_fifo = console_dir.join(format!("{id}.stdin"));
+    ensure_fifo(&console_fifo).map_err(internal_error)?;
+    let console_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&console_fifo)
+        .map_err(|error| internal_error(error.to_string()))?;
+    let console_stdin = console_file
+        .try_clone()
+        .map_err(|error| internal_error(error.to_string()))?;
     let args = blockheads_server_args(&input);
     let child = Command::new(&state.server_binary)
         .args(&args)
         .current_dir(&state.server_cwd)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::from(console_stdin))
         .stdout(log_file.into_std().await)
         .stderr(stderr.into_std().await)
         .spawn()
@@ -487,6 +535,9 @@ async fn start_server(
 
     let pid = child.id();
     manager.children.insert(id.clone(), child);
+    manager
+        .console_inputs
+        .insert(id.clone(), fs::File::from_std(console_file));
     let timestamp = now();
     let record = manager
         .processes
@@ -506,6 +557,7 @@ async fn start_server(
             game: None,
             run_id: None,
             run_started_at: None,
+            console_fifo: None,
             log_path: None,
             run_offset: 0,
             detached: false,
@@ -519,6 +571,7 @@ async fn start_server(
     record.status = ProcessStatus::Running;
     record.run_id = Some(run_id);
     record.run_started_at = Some(timestamp);
+    record.console_fifo = Some(console_fifo);
     record.log_path = Some(log_path);
     record.run_offset = run_offset;
     record.detached = false;
@@ -543,6 +596,7 @@ async fn stop_process(
         .get(&id)
         .ok_or_else(|| not_found("process not found"))?
         .pid;
+    let was_running = pid.is_some_and(process_is_alive);
     if let Some(pid) = pid {
         if process_is_alive(pid) {
             if let Some(child) = manager.children.get_mut(&id) {
@@ -561,6 +615,7 @@ async fn stop_process(
         }
     }
     manager.children.remove(&id);
+    manager.console_inputs.remove(&id);
     let record = manager
         .processes
         .get_mut(&id)
@@ -569,6 +624,14 @@ async fn stop_process(
     record.status = ProcessStatus::Stopped;
     record.detached = false;
     record.updated_at = now();
+    let stopped_log = (was_running && record.game.as_deref() == Some("blockheads_1"))
+        .then(|| record.log_path.clone())
+        .flatten();
+    if let Some(log_path) = stopped_log {
+        append_server_activity(&log_path, "server_stopped", now_activity_timestamp())
+            .await
+            .map_err(internal_error)?;
+    }
     persist_records(&state, &manager.processes)
         .await
         .map_err(internal_error)?;
@@ -832,6 +895,153 @@ async fn server_status(
     }))
 }
 
+async fn server_activity(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ServerActivity>>, (StatusCode, Json<ErrorView>)> {
+    validate_id(&id)?;
+    let record = {
+        let manager = state.inner.read().await;
+        manager.processes.get(&id).cloned()
+    };
+    let Some(record) = record.filter(|record| record.game.as_deref() == Some("blockheads_1"))
+    else {
+        return Ok(Json(Vec::new()));
+    };
+    let Some(log_path) = record.log_path else {
+        return Ok(Json(Vec::new()));
+    };
+    let Some(logs_dir) = log_path.parent() else {
+        return Err(internal_error("server log path has no parent directory"));
+    };
+    let mut entries = fs::read_dir(logs_dir)
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+    let mut paths = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?
+    {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "log") {
+            paths.push(path);
+        }
+    }
+    paths.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+
+    const MAX_ACTIVITY_FILES: usize = 7;
+    const MAX_ACTIVITY_FILE_BYTES: u64 = 256 * 1024;
+    let mut activities = Vec::new();
+    for path in paths.into_iter().take(MAX_ACTIVITY_FILES) {
+        let mut file = fs::File::open(&path)
+            .await
+            .map_err(|error| internal_error(error.to_string()))?;
+        let length = file
+            .metadata()
+            .await
+            .map_err(|error| internal_error(error.to_string()))?
+            .len();
+        file.seek(std::io::SeekFrom::Start(
+            length.saturating_sub(MAX_ACTIVITY_FILE_BYTES),
+        ))
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .await
+            .map_err(|error| internal_error(error.to_string()))?;
+        activities.extend(parse_server_activities(&String::from_utf8_lossy(&bytes)));
+    }
+    activities.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    activities.truncate(20);
+    Ok(Json(activities))
+}
+
+async fn server_command(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<ServerCommand>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorView>)> {
+    validate_id(&id)?;
+    let command = input.command.trim();
+    if command.is_empty()
+        || command.len() > 512
+        || command.chars().any(|character| character.is_control())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorView {
+                error: "command must be a single non-empty line of at most 512 characters".into(),
+            }),
+        ));
+    }
+
+    let mut manager = state.inner.write().await;
+    let record = manager
+        .processes
+        .get(&id)
+        .ok_or_else(|| not_found("server process not found"))?;
+    if record.game.as_deref() != Some("blockheads_1") {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorView {
+                error: "console commands are only available for Blockheads 1".into(),
+            }),
+        ));
+    }
+    let pid = record
+        .pid
+        .filter(|pid| process_is_alive(*pid))
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorView {
+                    error: "server is not running".into(),
+                }),
+            )
+        })?;
+
+    let console_fifo = record.console_fifo.clone().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorView {
+                error: "restart this server once to enable console commands".into(),
+            }),
+        )
+    })?;
+    if !manager.console_inputs.contains_key(&id) {
+        if !process_is_alive(pid) {
+            return Err(not_found("server is not running"));
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&console_fifo)
+            .map_err(|error| {
+                internal_error(format!("unable to open server console input: {error}"))
+            })?;
+        manager
+            .console_inputs
+            .insert(id.clone(), fs::File::from_std(file));
+    }
+    let mut line = command.as_bytes().to_vec();
+    line.push(b'\n');
+    let stdin = manager
+        .console_inputs
+        .get_mut(&id)
+        .expect("console input was opened");
+    stdin
+        .write_all(&line)
+        .await
+        .map_err(|error| internal_error(format!("unable to send console command: {error}")))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| internal_error(format!("unable to flush console command: {error}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn count_active_players(log: &str) -> usize {
     let mut players = HashSet::new();
     for line in log.lines() {
@@ -938,12 +1148,28 @@ async fn monitor_processes(state: AppState) {
                 };
                 if exited {
                     manager.children.remove(&id);
+                    let log_path = manager
+                        .processes
+                        .get(&id)
+                        .filter(|record| record.game.as_deref() == Some("blockheads_1"))
+                        .and_then(|record| record.log_path.clone());
                     if let Some(record) = manager.processes.get_mut(&id) {
                         record.pid = None;
                         record.status = ProcessStatus::Exited;
                         record.updated_at = now();
                         if record.auto_restart {
                             restart_ids.push(id.clone());
+                        }
+                    }
+                    if let Some(log_path) = log_path {
+                        if let Err(error) = append_server_activity(
+                            &log_path,
+                            "server_stopped",
+                            now_activity_timestamp(),
+                        )
+                        .await
+                        {
+                            error!(process_id = %id, %error, "failed to log server stop activity");
                         }
                     }
                 }
@@ -959,12 +1185,28 @@ async fn monitor_processes(state: AppState) {
                 })
                 .collect();
             for id in orphaned_ids {
+                let log_path = manager
+                    .processes
+                    .get(&id)
+                    .filter(|record| record.game.as_deref() == Some("blockheads_1"))
+                    .and_then(|record| record.log_path.clone());
                 if let Some(record) = manager.processes.get_mut(&id) {
                     record.pid = None;
                     record.status = ProcessStatus::Exited;
                     record.updated_at = now();
                     if record.auto_restart {
-                        restart_ids.push(id);
+                        restart_ids.push(id.clone());
+                    }
+                }
+                if let Some(log_path) = log_path {
+                    if let Err(error) = append_server_activity(
+                        &log_path,
+                        "server_stopped",
+                        now_activity_timestamp(),
+                    )
+                    .await
+                    {
+                        error!(process_id = %id, %error, "failed to log server stop activity");
                     }
                 }
             }
@@ -1012,6 +1254,86 @@ async fn open_daily_log(directory: &FsPath) -> Result<(PathBuf, tokio::fs::File)
         .open(&path)
         .await?;
     Ok((path, file))
+}
+
+fn now_activity_timestamp() -> String {
+    Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+async fn append_server_activity(
+    log_path: &FsPath,
+    kind: &str,
+    timestamp: String,
+) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(log_path)
+        .await
+        .map_err(|error| error.to_string())?;
+    file.write_all(format!("=== Activity {kind} {timestamp} ===\n").as_bytes())
+        .await
+        .map_err(|error| error.to_string())?;
+    file.flush().await.map_err(|error| error.to_string())
+}
+
+fn parse_server_activities(contents: &str) -> Vec<ServerActivity> {
+    let mut activities = Vec::new();
+    for line in contents.lines() {
+        if let Some(activity) = parse_server_activity_line(line) {
+            activities.push(activity);
+        }
+    }
+    activities
+}
+
+fn parse_server_activity_line(line: &str) -> Option<ServerActivity> {
+    let trimmed = line.trim();
+    if let Some(marker) = trimmed.strip_prefix("=== Activity ") {
+        let mut fields = marker.split_whitespace();
+        let kind = fields.next()?;
+        let date = fields.next()?;
+        let time = fields.next()?.trim_end_matches("===");
+        if !matches!(
+            kind,
+            "server_started" | "server_restarted" | "server_stopped"
+        ) {
+            return None;
+        }
+        return Some(ServerActivity {
+            kind: kind.to_string(),
+            message: match kind {
+                "server_started" => "Server started",
+                "server_restarted" => "Server restarted",
+                _ => "Server stopped",
+            }
+            .to_string(),
+            timestamp: format!("{date} {time}"),
+        });
+    }
+
+    let timestamp = trimmed.get(..23)?;
+    for (marker, kind, action) in [
+        (" - Player Connected ", "player_join", "joined"),
+        (" - Player Disconnected ", "player_leave", "left"),
+    ] {
+        let Some(start) = trimmed.find(marker) else {
+            continue;
+        };
+        let player_name = trimmed[start + marker.len()..]
+            .split(" | ")
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if player_name.is_empty() {
+            return None;
+        }
+        return Some(ServerActivity {
+            kind: kind.to_string(),
+            message: format!("Player {action}: {player_name}"),
+            timestamp: timestamp.to_string(),
+        });
+    }
+    None
 }
 
 fn validate_command(input: &CreateProcess) -> Result<(), (StatusCode, Json<ErrorView>)> {
@@ -1067,6 +1389,27 @@ fn valid_world_id(id: &str) -> bool {
         && id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn ensure_fifo(path: &FsPath) -> Result<(), String> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "console FIFO path contains a NUL byte".to_string())?;
+    let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EEXIST) {
+        return Err(format!("unable to create console FIFO: {error}"));
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("unable to inspect console FIFO: {error}"))?;
+    if !metadata.file_type().is_fifo() {
+        return Err("console input path exists but is not a FIFO".into());
+    }
+    Ok(())
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -1158,6 +1501,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn console_input_uses_a_private_reusable_fifo() {
+        let directory = env::temp_dir().join(format!("blockheads-console-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create console directory");
+        let fifo = directory.join("server.stdin");
+
+        ensure_fifo(&fifo).expect("create console fifo");
+        assert!(std::fs::symlink_metadata(&fifo)
+            .expect("inspect console fifo")
+            .file_type()
+            .is_fifo());
+        ensure_fifo(&fifo).expect("reuse console fifo");
+
+        std::fs::remove_dir_all(directory).expect("remove console directory");
+    }
+
+    #[test]
     fn counts_players_from_blockheads_connection_log_lines() {
         let logs = concat!(
             "2026-10-01 08:09:03.998 blockheads_server171[1158115:1158115] SKEEVES ASTEROID - Player Connected CAPI-BARA | 68.6.109.102 | 3a4e9c0c2cdf97571fa3b664f96ac0f2\n",
@@ -1170,6 +1529,35 @@ mod tests {
             "2026-10-01 08:09:42.501 blockheads_server171[1158115:1158115] SKEEVES ASTEROID - Player Disconnected CAPI-BARA\n",
         );
         assert_eq!(count_active_players(logs), 0);
+    }
+
+    #[test]
+    fn parses_activity_from_blockheads_player_log_lines() {
+        let logs = concat!(
+            "2026-10-01 08:09:03.998 blockheads_server171[1158115:1158115] SKEEVES ASTEROID - Player Connected CAPI-BARA | 68.6.109.102 | 3a4e9c0c2cdf97571fa3b664f96ac0f2\n",
+            "2026-10-01 08:09:42.400 blockheads_server171[1158115:1158115] SKEEVES ASTEROID - Client disconnected:3a4e9c0c2cdf97571fa3b664f96ac0f2\n",
+            "2026-10-01 08:09:42.501 blockheads_server171[1158115:1158115] SKEEVES ASTEROID - Player Disconnected CAPI-BARA\n",
+        );
+        let activities = parse_server_activities(logs);
+
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[0].kind, "player_join");
+        assert_eq!(activities[0].message, "Player joined: CAPI-BARA");
+        assert_eq!(activities[0].timestamp, "2026-10-01 08:09:03.998");
+        assert_eq!(activities[1].kind, "player_leave");
+        assert_eq!(activities[1].message, "Player left: CAPI-BARA");
+        assert_eq!(activities[1].timestamp, "2026-10-01 08:09:42.501");
+    }
+
+    #[test]
+    fn parses_server_lifecycle_activity_markers() {
+        let activities =
+            parse_server_activities("=== Activity server_restarted 2026-10-01 08:09:03.998 ===\n");
+
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].kind, "server_restarted");
+        assert_eq!(activities[0].message, "Server restarted");
+        assert_eq!(activities[0].timestamp, "2026-10-01 08:09:03.998");
     }
 
     #[test]

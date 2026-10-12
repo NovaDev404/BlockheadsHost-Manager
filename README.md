@@ -79,6 +79,8 @@ The game API uses the Supabase server row ID as the manager process ID:
 * `POST /v1/servers/{id}/disconnect` to leave the world running and persist it as disconnected
 * `POST /v1/servers/{id}/reconnect` to re-check the surviving process and reconnect it
 * `GET /v1/servers/{id}/status` for live process uptime and player count, inferred from the current run's connection logs
+* `GET /v1/servers/{id}/activity` for the latest server lifecycle and player join/leave events
+* `POST /v1/servers/{id}/command` with `{ "command": "..." }` to send a single-line command to a running Blockheads 1 server's stdin FIFO
 * `GET /v1/servers/{id}/logs?run_id=...&offset=...&wait=20`
 
 The first logs request omits `run_id` and `offset` to receive the complete
@@ -90,6 +92,14 @@ at `/api/servers/{id}/logs`.
 The status endpoint tracks `Player Connected` and `Player Disconnected` log
 events and reports uptime since the current process run started. The authenticated
 host API exposes it to the dashboard at `/api/servers/{id}/status`.
+The activity endpoint reads the latest seven dated world logs and returns up to
+20 newest events. It includes starts, restarts, stops, player joins, and player
+leaves; `Client disconnected` lines are ignored because they do not identify a
+confirmed player leave. The authenticated host API exposes it at
+`/api/servers/{id}/activity`.
+The private per-process stdin FIFO remains available to a surviving world
+process after the manager restarts, so console commands continue to work after
+the manager reconnects.
 
 The generic process API remains available. Its output is appended to
 `data/logs/{id}.log` and can be retrieved with
