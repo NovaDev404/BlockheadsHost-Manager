@@ -92,8 +92,8 @@ at `/api/servers/{id}/logs`.
 The status endpoint tracks `Player Connected` and `Player Disconnected` log
 events and reports uptime since the current process run started. The authenticated
 host API exposes it to the dashboard at `/api/servers/{id}/status`.
-The activity endpoint reads the latest seven dated world logs and returns up to
-20 newest events. It includes starts, restarts, stops, player joins, and player
+The activity endpoint reads the latest seven dated world logs and returns the
+five newest events. It includes starts, restarts, stops, player joins, and player
 leaves; `Client disconnected` lines are ignored because they do not identify a
 confirmed player leave. The authenticated host API exposes it at
 `/api/servers/{id}/activity`.

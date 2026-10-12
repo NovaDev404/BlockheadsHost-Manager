@@ -953,9 +953,7 @@ async fn server_activity(
             .map_err(|error| internal_error(error.to_string()))?;
         activities.extend(parse_server_activities(&String::from_utf8_lossy(&bytes)));
     }
-    activities.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    activities.truncate(20);
-    Ok(Json(activities))
+    Ok(Json(latest_server_activities(activities)))
 }
 
 async fn server_command(
@@ -1286,6 +1284,12 @@ fn parse_server_activities(contents: &str) -> Vec<ServerActivity> {
     activities
 }
 
+fn latest_server_activities(mut activities: Vec<ServerActivity>) -> Vec<ServerActivity> {
+    activities.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    activities.truncate(5);
+    activities
+}
+
 fn parse_server_activity_line(line: &str) -> Option<ServerActivity> {
     let trimmed = line.trim();
     if let Some(marker) = trimmed.strip_prefix("=== Activity ") {
@@ -1558,6 +1562,23 @@ mod tests {
         assert_eq!(activities[0].kind, "server_restarted");
         assert_eq!(activities[0].message, "Server restarted");
         assert_eq!(activities[0].timestamp, "2026-10-01 08:09:03.998");
+    }
+
+    #[test]
+    fn returns_only_the_five_newest_activity_events() {
+        let activities = (1..=7)
+            .map(|minute| ServerActivity {
+                kind: "player_join".into(),
+                message: format!("Player {minute} joined"),
+                timestamp: format!("2026-10-01 08:{minute:02}:00.000"),
+            })
+            .collect();
+
+        let latest = latest_server_activities(activities);
+
+        assert_eq!(latest.len(), 5);
+        assert_eq!(latest[0].message, "Player 7 joined");
+        assert_eq!(latest[4].message, "Player 3 joined");
     }
 
     #[test]
