@@ -1,15 +1,18 @@
 use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
     Json, Router,
 };
-use chrono::Local;
+use chrono::{Local, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
-use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{FileTypeExt, PermissionsExt},
+};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -21,7 +24,7 @@ use std::{
 };
 use tokio::{
     fs::{self, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::RwLock,
 };
@@ -31,11 +34,34 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     inner: Arc<RwLock<ManagerState>>,
+    deletion_jobs: Arc<RwLock<HashMap<String, ServerDeletionJob>>>,
     token: Arc<str>,
     data_dir: PathBuf,
     server_binary: PathBuf,
     server_cwd: PathBuf,
     saves_dir: PathBuf,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ServerDeletionJob {
+    id: String,
+    server_id: String,
+    world_id: String,
+    status: String,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeleteServer {
+    world_id: String,
+}
+
+#[derive(Serialize)]
+struct ServerDeletionView {
+    id: String,
+    server_id: String,
+    status: String,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -185,6 +211,14 @@ struct ServerLogView {
 }
 
 #[derive(Serialize)]
+struct ServerLogFileView {
+    date: String,
+    from: Option<String>,
+    till: Option<String>,
+    size_bytes: u64,
+}
+
+#[derive(Serialize)]
 struct ErrorView {
     error: String,
 }
@@ -209,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         inner: Arc::new(RwLock::new(ManagerState::default())),
+        deletion_jobs: Arc::new(RwLock::new(HashMap::new())),
         token: Arc::from(token),
         data_dir,
         server_binary: PathBuf::from(
@@ -221,6 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })),
     };
     load_records(&state).await?;
+    load_deletion_jobs(&state).await?;
+    resume_server_deletions(state.clone()).await;
     let monitor_state = state.clone();
     tokio::spawn(async move {
         monitor_processes(monitor_state).await;
@@ -238,6 +275,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/processes/{id}/restart", post(restart_process))
         .route("/v1/processes/{id}/logs", get(process_logs))
         .route("/v1/servers/{id}/start", post(start_server))
+        .route(
+            "/v1/server-deletions/{id}",
+            get(get_server_deletion).post(delete_server),
+        )
         .route("/v1/servers/{id}/stop", post(stop_process))
         .route("/v1/servers/{id}/disconnect", post(disconnect_process))
         .route("/v1/servers/{id}/reconnect", post(reconnect_process))
@@ -245,6 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/servers/{id}/activity", get(server_activity))
         .route("/v1/servers/{id}/command", post(server_command))
         .route("/v1/servers/{id}/logs", get(server_logs))
+        .route("/v1/servers/{id}/log-files", get(server_log_files))
+        .route("/v1/servers/{id}/log-files/{date}", get(server_log_file))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate));
 
     let app = Router::new().merge(protected).with_state(state);
@@ -445,6 +488,21 @@ async fn start_server(
             StatusCode::BAD_REQUEST,
             Json(ErrorView {
                 error: "port and max_players must be valid positive values".into(),
+            }),
+        ));
+    }
+
+    let deletion_in_progress = state
+        .deletion_jobs
+        .read()
+        .await
+        .values()
+        .any(|job| job.server_id == id && matches!(job.status.as_str(), "pending" | "running"));
+    if deletion_in_progress {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorView {
+                error: "this server is being deleted".into(),
             }),
         ));
     }
@@ -824,6 +882,140 @@ async fn server_logs(
     }
 }
 
+async fn server_log_files(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ServerLogFileView>>, (StatusCode, Json<ErrorView>)> {
+    validate_id(&id)?;
+    let record = {
+        let manager = state.inner.read().await;
+        manager.processes.get(&id).cloned()
+    };
+    let Some(record) = record.filter(|record| record.game.as_deref() == Some("blockheads_1"))
+    else {
+        return Ok(Json(Vec::new()));
+    };
+    let Some(log_path) = record.log_path else {
+        return Ok(Json(Vec::new()));
+    };
+    let Some(logs_dir) = log_path.parent() else {
+        return Err(internal_error("server log path has no parent directory"));
+    };
+
+    let mut entries = fs::read_dir(logs_dir)
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+    let mut log_files = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?
+    {
+        let path = entry.path();
+        let Some(date) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if path.extension().is_none_or(|extension| extension != "log")
+            || NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err()
+        {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .await
+            .map_err(|error| internal_error(error.to_string()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let (from, till) = read_log_time_range(&path)
+            .await
+            .map_err(|error| internal_error(error))?;
+        log_files.push(ServerLogFileView {
+            date: date.to_string(),
+            from,
+            till,
+            size_bytes: metadata.len(),
+        });
+    }
+    log_files.sort_by(|left, right| right.date.cmp(&left.date));
+    Ok(Json(log_files))
+}
+
+async fn server_log_file(
+    State(state): State<AppState>,
+    Path((id, date)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<ErrorView>)> {
+    validate_id(&id)?;
+    if NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_err() {
+        return Err(not_found("log file not found"));
+    }
+    let record = {
+        let manager = state.inner.read().await;
+        manager.processes.get(&id).cloned()
+    };
+    let Some(record) = record.filter(|record| record.game.as_deref() == Some("blockheads_1"))
+    else {
+        return Err(not_found("log file not found"));
+    };
+    let Some(log_path) = record.log_path else {
+        return Err(not_found("log file not found"));
+    };
+    let Some(logs_dir) = log_path.parent() else {
+        return Err(internal_error("server log path has no parent directory"));
+    };
+    let path = logs_dir.join(format!("{date}.log"));
+    let contents = fs::read(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            not_found("log file not found")
+        } else {
+            internal_error(error.to_string())
+        }
+    })?;
+    let mut response = Response::new(Body::from(String::from_utf8_lossy(&contents).into_owned()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Ok(response)
+}
+
+async fn read_log_time_range(path: &FsPath) -> Result<(Option<String>, Option<String>), String> {
+    let file = fs::File::open(path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut lines = BufReader::new(file);
+    let mut from = None;
+    let mut till = None;
+    let mut line = Vec::new();
+    while lines
+        .read_until(b'\n', &mut line)
+        .await
+        .map_err(|error| error.to_string())?
+        > 0
+    {
+        if let Some(timestamp) = parse_log_timestamp(&String::from_utf8_lossy(&line)) {
+            from.get_or_insert_with(|| timestamp.clone());
+            till = Some(timestamp);
+        }
+        line.clear();
+    }
+    Ok((from, till))
+}
+
+fn parse_log_timestamp(line: &str) -> Option<String> {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    fields.windows(2).find_map(|pair| {
+        let date = NaiveDate::parse_from_str(pair[0], "%Y-%m-%d").ok()?;
+        let time = pair[1].trim_end_matches("===");
+        let timestamp = NaiveDateTime::parse_from_str(
+            &format!("{} {time}", date.format("%Y-%m-%d")),
+            "%Y-%m-%d %H:%M:%S%.f",
+        )
+        .ok()?;
+        Some(timestamp.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+    })
+}
+
 async fn server_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -954,6 +1146,179 @@ async fn server_activity(
         activities.extend(parse_server_activities(&String::from_utf8_lossy(&bytes)));
     }
     Ok(Json(latest_server_activities(activities)))
+}
+
+async fn delete_server(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<DeleteServer>,
+) -> Result<(StatusCode, Json<ServerDeletionView>), (StatusCode, Json<ErrorView>)> {
+    validate_id(&id)?;
+    if !valid_world_id(&input.world_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorView {
+                error: "invalid world ID".into(),
+            }),
+        ));
+    }
+
+    let mut jobs = state.deletion_jobs.write().await;
+    if let Some(existing) = jobs.values().find(|job| {
+        job.server_id == id
+            && job.world_id == input.world_id
+            && matches!(job.status.as_str(), "pending" | "running" | "completed")
+    }) {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(ServerDeletionView {
+                id: existing.id.clone(),
+                server_id: existing.server_id.clone(),
+                status: existing.status.clone(),
+                error: existing.error.clone(),
+            }),
+        ));
+    }
+
+    let job = ServerDeletionJob {
+        id: Uuid::new_v4().to_string(),
+        server_id: id,
+        world_id: input.world_id,
+        status: "pending".into(),
+        error: None,
+    };
+    jobs.insert(job.id.clone(), job.clone());
+    persist_deletion_jobs(&state, &jobs)
+        .await
+        .map_err(internal_error)?;
+    drop(jobs);
+
+    let worker_state = state.clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        run_server_deletion(worker_state, job_id).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ServerDeletionView {
+            id: job.id,
+            server_id: job.server_id,
+            status: job.status,
+            error: None,
+        }),
+    ))
+}
+
+async fn get_server_deletion(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ServerDeletionView>, (StatusCode, Json<ErrorView>)> {
+    validate_id(&id)?;
+    let jobs = state.deletion_jobs.read().await;
+    jobs.get(&id)
+        .map(|job| {
+            Json(ServerDeletionView {
+                id: job.id.clone(),
+                server_id: job.server_id.clone(),
+                status: job.status.clone(),
+                error: job.error.clone(),
+            })
+        })
+        .ok_or_else(|| not_found("deletion job not found"))
+}
+
+async fn run_server_deletion(state: AppState, job_id: String) {
+    let job = {
+        let mut jobs = state.deletion_jobs.write().await;
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.status = "running".into();
+        job.error = None;
+        let job = job.clone();
+        if let Err(error) = persist_deletion_jobs(&state, &jobs).await {
+            error!(deletion_id = %job_id, %error, "failed to persist server deletion state");
+            return;
+        }
+        job
+    };
+
+    let result = async {
+        let has_process = state
+            .inner
+            .read()
+            .await
+            .processes
+            .contains_key(&job.server_id);
+        if has_process {
+            let _ = stop_process(State(state.clone()), Path(job.server_id.clone()))
+                .await
+                .map_err(|(_, Json(error))| error.error)?;
+        }
+
+        match fs::canonicalize(&state.saves_dir).await {
+            Ok(saves_root) => {
+                let world_path = saves_root.join(&job.world_id);
+                match fs::symlink_metadata(&world_path).await {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(
+                            "world directory is a symbolic link; refusing to remove it".into()
+                        );
+                    }
+                    Ok(metadata) if metadata.is_dir() => {
+                        force_remove_world_dir(&world_path)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(_) => return Err("world path exists but is not a directory".into()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+
+        let mut manager = state.inner.write().await;
+        manager.processes.remove(&job.server_id);
+        manager.children.remove(&job.server_id);
+        drop(manager.console_inputs.remove(&job.server_id));
+        persist_records(&state, &manager.processes).await?;
+        drop(manager);
+        let console_fifo = state
+            .data_dir
+            .join("console")
+            .join(format!("{}.stdin", job.server_id));
+        match fs::remove_file(console_fifo).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+
+    if let Err(error) = &result {
+        warn!(deletion_id = %job_id, server_id = %job.server_id, %error, "server deletion failed");
+    }
+
+    let mut jobs = state.deletion_jobs.write().await;
+    if let Some(job) = jobs.get_mut(&job_id) {
+        match result {
+            Ok(()) => {
+                job.status = "completed".into();
+                job.error = None;
+            }
+            Err(error) => {
+                job.status = "failed".into();
+                job.error = Some(error);
+            }
+        }
+        if let Err(error) = persist_deletion_jobs(&state, &jobs).await {
+            error!(deletion_id = %job_id, %error, "failed to persist server deletion result");
+        }
+    }
 }
 
 async fn server_command(
@@ -1100,6 +1465,62 @@ async fn load_records(state: &AppState) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+async fn load_deletion_jobs(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    let path = state.data_dir.join("server-deletions.json");
+    let contents = match fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut jobs: HashMap<String, ServerDeletionJob> = serde_json::from_str(&contents)?;
+    for job in jobs.values_mut() {
+        if matches!(job.status.as_str(), "pending" | "running") {
+            job.status = "pending".into();
+            job.error = None;
+        }
+    }
+    let mut stored_jobs = state.deletion_jobs.write().await;
+    *stored_jobs = jobs;
+    persist_deletion_jobs(state, &stored_jobs).await?;
+    Ok(())
+}
+
+async fn resume_server_deletions(state: AppState) {
+    let pending: Vec<String> = state
+        .deletion_jobs
+        .read()
+        .await
+        .values()
+        .filter(|job| job.status == "pending")
+        .map(|job| job.id.clone())
+        .collect();
+    for job_id in pending {
+        let worker_state = state.clone();
+        tokio::spawn(async move {
+            run_server_deletion(worker_state, job_id).await;
+        });
+    }
+}
+
+async fn persist_deletion_jobs(
+    state: &AppState,
+    jobs: &HashMap<String, ServerDeletionJob>,
+) -> Result<(), String> {
+    let path = state.data_dir.join("server-deletions.json");
+    let temporary = state.data_dir.join("server-deletions.json.tmp");
+    let contents = serde_json::to_vec_pretty(jobs).map_err(|error| error.to_string())?;
+    let mut file = fs::File::create(&temporary)
+        .await
+        .map_err(|error| error.to_string())?;
+    file.write_all(&contents)
+        .await
+        .map_err(|error| error.to_string())?;
+    file.sync_all().await.map_err(|error| error.to_string())?;
+    fs::rename(temporary, path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn reconcile(state: &AppState) -> Result<(), String> {
     let mut manager = state.inner.write().await;
     let ids: Vec<String> = manager.processes.keys().cloned().collect();
@@ -1240,6 +1661,36 @@ async fn persist_records(
     fs::rename(temporary, path)
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn force_remove_world_dir(root: &FsPath) -> Result<(), std::io::Error> {
+    let mut pending = vec![(root.to_path_buf(), false)];
+    while let Some((path, expanded)) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() || !file_type.is_dir() {
+            if !file_type.is_symlink() {
+                fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+            }
+            fs::remove_file(path).await?;
+        } else if expanded {
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await?;
+            fs::remove_dir(path).await?;
+        } else {
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await?;
+            pending.push((path.clone(), true));
+            let mut entries = fs::read_dir(path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                pending.push((entry.path(), false));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn open_daily_log(directory: &FsPath) -> Result<(PathBuf, tokio::fs::File), std::io::Error> {
@@ -1562,6 +2013,50 @@ mod tests {
         assert_eq!(activities[0].kind, "server_restarted");
         assert_eq!(activities[0].message, "Server restarted");
         assert_eq!(activities[0].timestamp, "2026-10-01 08:09:03.998");
+    }
+
+    #[test]
+    fn parses_timestamps_from_output_and_activity_log_lines() {
+        assert_eq!(
+            parse_log_timestamp("2026-10-01 08:09:03.998 blockheads_server171[1:1] Server started"),
+            Some("2026-10-01 08:09:03.998".into())
+        );
+        assert_eq!(
+            parse_log_timestamp("=== Activity server_stopped 2026-10-01 08:09:42.5 ==="),
+            Some("2026-10-01 08:09:42.500".into())
+        );
+        assert_eq!(parse_log_timestamp("unrecognized log line"), None);
+    }
+
+    #[tokio::test]
+    async fn force_removes_read_only_world_contents_without_following_symlinks() {
+        let directory = env::temp_dir().join(format!("blockheads-delete-{}", Uuid::new_v4()));
+        let world = directory.join("world");
+        let nested = world.join("nested");
+        std::fs::create_dir_all(&nested).expect("create world directory");
+        let saved_file = nested.join("world.dat");
+        std::fs::write(&saved_file, "world data").expect("write world file");
+        let outside_file = directory.join("outside.dat");
+        std::fs::write(&outside_file, "keep").expect("write external file");
+        std::os::unix::fs::symlink(&outside_file, world.join("external-link"))
+            .expect("create external symlink");
+        std::fs::set_permissions(&saved_file, std::fs::Permissions::from_mode(0o400))
+            .expect("make world file read-only");
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o500))
+            .expect("make nested directory read-only");
+        std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o500))
+            .expect("make world directory read-only");
+
+        force_remove_world_dir(&world)
+            .await
+            .expect("force-remove world directory");
+
+        assert!(!world.exists());
+        assert_eq!(
+            std::fs::read_to_string(outside_file).expect("read external file"),
+            "keep"
+        );
+        std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[test]

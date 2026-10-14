@@ -80,7 +80,10 @@ The game API uses the Supabase server row ID as the manager process ID:
 * `POST /v1/servers/{id}/reconnect` to re-check the surviving process and reconnect it
 * `GET /v1/servers/{id}/status` for live process uptime and player count, inferred from the current run's connection logs
 * `GET /v1/servers/{id}/activity` for the latest server lifecycle and player join/leave events
+* `GET /v1/servers/{id}/log-files` for dated log files and their timestamp ranges
+* `GET /v1/servers/{id}/log-files/{date}` for the contents of a dated log file
 * `POST /v1/servers/{id}/command` with `{ "command": "..." }` to send a single-line command to a running Blockheads 1 server's stdin FIFO
+* `POST /v1/server-deletions/{id}` with `{ "world_id": "..." }` to start a durable server deletion; poll `GET /v1/server-deletions/{job_id}` for its status
 * `GET /v1/servers/{id}/logs?run_id=...&offset=...&wait=20`
 
 The first logs request omits `run_id` and `offset` to receive the complete
@@ -97,9 +100,17 @@ five newest events. It includes starts, restarts, stops, player joins, and playe
 leaves; `Client disconnected` lines are ignored because they do not identify a
 confirmed player leave. The authenticated host API exposes it at
 `/api/servers/{id}/activity`.
+The log-files endpoint lists each dated log with its first and last recorded
+timestamps and byte size. The date-specific endpoint returns that file as plain
+text; the dashboard uses it to view and download archived logs. Both endpoints
+are authenticated through the host API at `/api/servers/{id}/log-files`.
 The private per-process stdin FIFO remains available to a surviving world
 process after the manager restarts, so console commands continue to work after
 the manager reconnects.
+Server deletion jobs are persisted in `data/server-deletions.json`. The manager
+stops the server, force-removes only its direct world directory under
+`BLOCKHEADS_SAVES_DIR`, and forgets the managed process. Pending jobs resume if
+the manager restarts.
 
 The generic process API remains available. Its output is appended to
 `data/logs/{id}.log` and can be retrieved with
