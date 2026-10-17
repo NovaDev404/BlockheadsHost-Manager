@@ -37,6 +37,7 @@ struct AppState {
     deletion_jobs: Arc<RwLock<HashMap<String, ServerDeletionJob>>>,
     token: Arc<str>,
     data_dir: PathBuf,
+    logs_dir: PathBuf,
     server_binary: PathBuf,
     server_cwd: PathBuf,
     saves_dir: PathBuf,
@@ -194,6 +195,10 @@ fn blockheads_server_args(input: &StartServer) -> Vec<String> {
     args
 }
 
+fn world_logs_dir(base_dir: &FsPath, world_id: &str) -> PathBuf {
+    base_dir.join(world_id).join("logs")
+}
+
 #[derive(Deserialize)]
 struct LogQuery {
     run_id: Option<String>,
@@ -235,6 +240,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(env::var("BLOCKHEADS_MANAGER_DATA").unwrap_or_else(|_| "./data".into()));
     fs::create_dir_all(data_dir.join("logs")).await?;
 
+    let logs_dir = PathBuf::from(
+        env::var("BLOCKHEADS_LOGS_DIR").unwrap_or_else(|_| "/media/novadev/storage/blockheadshost/logs".into()),
+    );
+    fs::create_dir_all(&logs_dir).await?;
+
     let token =
         env::var("BLOCKHEADS_MANAGER_TOKEN").map_err(|_| "BLOCKHEADS_MANAGER_TOKEN must be set")?;
     if token.len() < 32 {
@@ -246,6 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         deletion_jobs: Arc::new(RwLock::new(HashMap::new())),
         token: Arc::from(token),
         data_dir,
+        logs_dir,
         server_binary: PathBuf::from(
             env::var("BLOCKHEADS_SERVER_BINARY")
                 .unwrap_or_else(|_| "./blockheads_server171".into()),
@@ -522,7 +533,7 @@ async fn start_server(
         }
     }
 
-    let logs_dir = state.saves_dir.join(&world_id).join("logs");
+    let logs_dir = world_logs_dir(&state.logs_dir, &world_id);
     fs::create_dir_all(&logs_dir)
         .await
         .map_err(|error| internal_error(error.to_string()))?;
@@ -1954,6 +1965,15 @@ impl From<&ProcessRecord> for ProcessView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn world_logs_dir_puts_each_world_under_the_log_root() {
+        let root = FsPath::new("/media/novadev/storage/blockheadshost/logs");
+        assert_eq!(
+            world_logs_dir(root, "world-123"),
+            FsPath::new("/media/novadev/storage/blockheadshost/logs/world-123/logs")
+        );
+    }
 
     #[test]
     fn console_input_uses_a_private_reusable_fifo() {

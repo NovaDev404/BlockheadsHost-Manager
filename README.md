@@ -30,18 +30,20 @@ argument vector, never through a shell:
 For Sapphire and Diamond plans, BlockheadsHost requests `--no-exit` when starting
 the world. Amethyst starts omit that flag.
 
-By default the world save and run logs are under:
+By default the world run logs are under:
 
 ```text
-/home/novadev/GNUstep/Library/ApplicationSupport/TheBlockheads/saves/WORLD_ID/logs/
+/media/novadev/storage/blockheadshost/logs/WORLD_ID/logs/
 ```
 
-Set `BLOCKHEADS_SAVES_DIR` to override that saves directory. Each start creates
-one local-date file (`YYYY-MM-DD.log`) and appends a run marker plus that run's
-output. Restarts on the same day stay together in that date's file; the first
-start on the next local date creates a new file. Output is written directly
-while the game process runs. `BLOCKHEADS_SERVER_CWD` sets the executable's
-working directory; it defaults to the manager's working directory.
+Set `BLOCKHEADS_LOGS_DIR` to override that log-root directory, and set
+`BLOCKHEADS_SAVES_DIR` to override the save-root directory independently.
+Each start creates one local-date file (`YYYY-MM-DD.log`) and appends a run
+marker plus that run's output. Restarts on the same day stay together in that
+date's file; the first start on the next local date creates a new file. Output
+is written directly while the game process runs. `BLOCKHEADS_SERVER_CWD` sets
+the executable's working directory; it defaults to the manager's working
+directory.
 
 Blockheads 2 option is reserved but currently returns HTTP 501 until its
 server executable is added.
